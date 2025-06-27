@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, normalizePath, Notice, TFile } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, normalizePath, Notice, TFile, AbstractInputSuggest } from 'obsidian';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -24,6 +24,7 @@ export default class MCPPlugin extends Plugin {
 	private transport: StdioServerTransport | null = null;
 	settings: MCPPluginSettings;
 	loadedTools: Map<string, Tool> = new Map();
+	// eslint-disable-next-line @typescript-eslint/ban-types
 	private customToolFunctions: Map<string, Function> = new Map();
 
 	async onload() {
@@ -504,8 +505,8 @@ class MCPSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('Tools Folder')
 			.setDesc('Folder in vault where custom tool .js files are stored')
-			.addText((text) =>
-				text
+			.addSearch(search => {
+				search
 					.setPlaceholder('mcp-tools')
 					.setValue(this.plugin.settings.toolsFolder)
 					.onChange(async (value) => {
@@ -516,8 +517,11 @@ class MCPSettingTab extends PluginSettingTab {
 						if (this.plugin.settings.enabled && this.plugin.server) {
 							await this.plugin.loadToolsFromFolder();
 						}
-					})
-			);
+					});
+
+				// Add folder suggestions
+				new FolderSuggest(this.app, search.inputEl);
+			});
 
 		// Add button to reload tools
 		new Setting(containerEl)
@@ -561,5 +565,35 @@ function getCurrentDateTime(params) {
 
 module.exports = getCurrentDateTime;`
 		});
+	}
+}
+
+class FolderSuggest extends AbstractInputSuggest<string> {
+	private folders: string[];
+	private inputElement: HTMLInputElement;
+
+	constructor(app: App, inputEl: HTMLInputElement) {
+		super(app, inputEl);
+		this.inputElement = inputEl;
+		// Get all folders and include root folder
+		this.folders = ["/"].concat(this.app.vault.getAllFolders().map(folder => folder.path));
+	}
+
+	getSuggestions(inputStr: string): string[] {
+		const inputLower = inputStr.toLowerCase();
+		return this.folders.filter(folder =>
+			folder.toLowerCase().includes(inputLower)
+		);
+	}
+
+	renderSuggestion(folder: string, el: HTMLElement): void {
+		el.createEl("div", { text: folder });
+	}
+
+	selectSuggestion(folder: string): void {
+		this.inputElement.value = folder;
+		const event = new Event('input');
+		this.inputElement.dispatchEvent(event);
+		this.close();
 	}
 }

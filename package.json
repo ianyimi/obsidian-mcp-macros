@@ -6,7 +6,7 @@
 	"type": "module",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
-		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production && cp ./main.js ~/Documents/Obsidian/Vaults/The\\ Lab\\ v2/.obsidian/plugins/obsidian-mcp-macros/ && cp ./manifest.json ~/Documents/Obsidian/Vaults/The\\ Lab\\ v2/.obsidian/plugins/obsidian-mcp-macros/",
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
 	"keywords": [],
