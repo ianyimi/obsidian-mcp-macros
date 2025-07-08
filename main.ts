@@ -516,7 +516,7 @@ module.exports = getCurrentDateTime;`;
 			};
 
 			// Load the function as a proper module
-			const toolFunction = this.loadToolModule(content, toolName);
+			const toolFunction = await this.loadToolModule(content, toolName);
 			if (toolFunction) {
 				this.customToolFunctions.set(toolName, toolFunction);
 				this.loadedTools.set(toolName, tool);
@@ -748,63 +748,46 @@ module.exports = getCurrentDateTime;`;
 		}
 	}
 
-	private loadToolModule(content: string, toolName: string): Function | null {
+	private async loadToolModule(content: string, toolName: string): Promise<Function | null> {
 		try {
-			// Create execution context with Obsidian APIs
-			const context = {
-				module: { exports: {} },
-				exports: {},
-				console,
-				JSON,
-				Date,
-				Math,
-				parseInt,
-				parseFloat,
-				String,
-				Number,
-				Boolean,
-				Array,
-				Object,
-				// Obsidian APIs available to tools
-				app: this.app,
-				vault: this.app.vault,
-				workspace: this.app.workspace
-			};
+			// Create a data URL with the module content
+			const moduleContent = `
+// Obsidian APIs are available via the global plugin context
+const app = window.obsidianApp;
+const vault = window.obsidianVault; 
+const workspace = window.obsidianWorkspace;
 
-			// Execute the module code once to get the exported function
-			const moduleCode = `
-				(function(module, exports, console, JSON, Date, Math, parseInt, parseFloat, String, Number, Boolean, Array, Object, app, vault, workspace) {
-					${content}
-					return module.exports || exports;
-				})
-			`;
+${content}
 
-			const moduleFactory = eval(moduleCode);
-			const exportedFunction = moduleFactory(
-				context.module,
-				context.exports,
-				context.console,
-				context.JSON,
-				context.Date,
-				context.Math,
-				context.parseInt,
-				context.parseFloat,
-				context.String,
-				context.Number,
-				context.Boolean,
-				context.Array,
-				context.Object,
-				context.app,
-				context.vault,
-				context.workspace
-			);
+// Export the function
+export default (typeof module !== 'undefined' && module.exports) || 
+               (typeof exports !== 'undefined' && exports.default) ||
+               getCurrentDateTime; // fallback for simple function declarations
+`;
 
-			if (typeof exportedFunction === 'function') {
-				console.log(`Successfully loaded tool module: ${toolName}`);
-				return exportedFunction;
-			} else {
-				console.error(`Tool ${toolName} does not export a function`);
-				return null;
+			// Set global context
+			(window as any).obsidianApp = this.app;
+			(window as any).obsidianVault = this.app.vault;
+			(window as any).obsidianWorkspace = this.app.workspace;
+
+			// Create blob URL and import
+			const blob = new Blob([moduleContent], { type: 'application/javascript' });
+			const moduleUrl = URL.createObjectURL(blob);
+
+			try {
+				const module = await import(moduleUrl);
+				const exportedFunction = module.default;
+				
+				if (typeof exportedFunction === 'function') {
+					console.log(`Successfully loaded tool module: ${toolName}`);
+					return exportedFunction;
+				} else {
+					console.error(`Tool ${toolName} does not export a function, got:`, typeof exportedFunction);
+					return null;
+				}
+			} finally {
+				// Clean up the blob URL
+				URL.revokeObjectURL(moduleUrl);
 			}
 		} catch (error) {
 			console.error(`Failed to load tool module ${toolName}:`, error);
