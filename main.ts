@@ -1,40 +1,60 @@
-import { App, Plugin, PluginSettingTab, Setting, normalizePath, Notice, TFile, AbstractInputSuggest } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, normalizePath, Notice, TFile, AbstractInputSuggest, Modal } from 'obsidian';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
 	CallToolRequestSchema,
 	ListToolsRequestSchema,
 	CallToolResult,
-	Tool
+	Tool,
+	JSONRPCMessage,
+	JSONRPCRequest,
+	JSONRPCResponse,
+	JSONRPCNotification,
+	InitializeRequestSchema,
+	InitializedNotificationSchema
 } from '@modelcontextprotocol/sdk/types.js';
 import * as path from 'path';
+import * as http from 'http';
 
 interface MCPPluginSettings {
 	toolsFolder: string;
 	enabled: boolean;
+	serverPort: number;
+	serverHost: string;
 }
 
 const DEFAULT_SETTINGS: MCPPluginSettings = {
 	toolsFolder: 'mcp-tools',
 	enabled: false,
+	serverPort: 3000,
+	serverHost: 'localhost',
 };
 
 export default class MCPPlugin extends Plugin {
-	server: Server | null = null;
-	private transport: StdioServerTransport | null = null;
+	private httpServer: http.Server | null = null;
+	private sessions: Map<string, {
+		server: Server;
+		lastActivity: number;
+	}> = new Map();
 	settings: MCPPluginSettings;
 	loadedTools: Map<string, Tool> = new Map();
-	// eslint-disable-next-line @typescript-eslint/ban-types
 	private customToolFunctions: Map<string, Function> = new Map();
+	private fileWatcher: any = null;
 
 	async onload() {
 		console.log('Loading MCP Tools Plugin');
 		await this.loadSettings();
 		this.addSettingTab(new MCPSettingTab(this.app, this));
 
+		// Always load tools on startup
+		await this.loadToolsFromFolder();
+
 		if (this.settings.enabled) {
 			await this.initializeMCPServer();
+			await this.startHTTPServer();
 		}
+
+		// Set up directory monitoring for automatic tool reloading
+		this.setupDirectoryMonitoring();
 
 		// Add command to toggle MCP server
 		this.addCommand({
@@ -53,33 +73,8 @@ export default class MCPPlugin extends Plugin {
 
 	async initializeMCPServer() {
 		try {
-			await this.loadToolsFromFolder();
-
-			this.server = new Server({
-				name: 'obsidian-vault-tools',
-				version: '0.1.0'
-			}, {
-				capabilities: {
-					tools: {}
-				}
-			});
-
-			// Register list tools handler
-			this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-				return {
-					tools: Array.from(this.loadedTools.values())
-				};
-			});
-
-			// Register call tool handler
-			this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-				return await this.callTool(request.params.name, request.params.arguments || {});
-			});
-
-			// For stdio transport in a plugin, we need to create a mock transport
-			// since we can't actually use stdio within Obsidian
-			// Instead, we'll expose the server methods directly
-
+			// Tools are already loaded in onload(), no need to reload here
+			// Server will be created per session in HTTP transport
 			new Notice('MCP Server initialized successfully');
 			console.log('MCP server initialized with tools:', Array.from(this.loadedTools.keys()));
 		} catch (error) {
@@ -88,12 +83,39 @@ export default class MCPPlugin extends Plugin {
 		}
 	}
 
+	private createServerInstance(): Server {
+		const server = new Server({
+			name: 'obsidian-vault-tools',
+			version: '0.1.0'
+		}, {
+			capabilities: {
+				tools: {}
+			}
+		});
+
+		// Register list tools handler
+		server.setRequestHandler(ListToolsRequestSchema, async () => {
+			return {
+				tools: Array.from(this.loadedTools.values())
+			};
+		});
+
+		// Register call tool handler
+		server.setRequestHandler(CallToolRequestSchema, async (request) => {
+			return await this.callTool(request.params.name, request.params.arguments || {});
+		});
+
+		return server;
+	}
+
 	async toggleMCPServer() {
 		this.settings.enabled = !this.settings.enabled;
 		await this.saveSettings();
 
 		if (this.settings.enabled) {
+			// Tools are already loaded, just initialize and start server
 			await this.initializeMCPServer();
+			await this.startHTTPServer();
 			new Notice('MCP Server enabled');
 		} else {
 			this.shutdownServer();
@@ -102,7 +124,7 @@ export default class MCPPlugin extends Plugin {
 	}
 
 	async reloadTools() {
-		if (this.settings.enabled && this.server) {
+		if (this.settings.enabled) {
 			await this.loadToolsFromFolder();
 			new Notice(`Reloaded ${this.loadedTools.size} tools`);
 		} else {
@@ -111,18 +133,287 @@ export default class MCPPlugin extends Plugin {
 	}
 
 	shutdownServer() {
-		if (this.server) {
-			this.server.close();
-			this.server = null;
+		// Close all session servers
+		for (const [sessionId, session] of this.sessions) {
+			try {
+				session.server.close();
+			} catch (error) {
+				console.error(`Error closing session ${sessionId}:`, error);
+			}
 		}
-		if (this.transport) {
-			this.transport.close();
-			this.transport = null;
+		this.sessions.clear();
+
+		if (this.httpServer) {
+			this.httpServer.close();
+			this.httpServer = null;
+		}
+	}
+
+	async startHTTPServer() {
+		try {
+			this.httpServer = http.createServer(async (req, res) => {
+				const url = new URL(req.url || '/', `http://${req.headers.host}`);
+
+				// Handle CORS
+				const corsHeaders = {
+					'Access-Control-Allow-Origin': '*',
+					'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+					'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version',
+				};
+
+				// Set CORS headers
+				Object.entries(corsHeaders).forEach(([key, value]) => {
+					res.setHeader(key, value);
+				});
+
+				if (req.method === 'OPTIONS') {
+					res.writeHead(200);
+					res.end();
+					return;
+				}
+
+				try {
+					// Handle MCP Streamable HTTP Transport
+					if (url.pathname === '/mcp' && req.method === 'POST') {
+						const body = await this.getRequestBody(req);
+						const response = await this.handleMCPRequest(body, corsHeaders);
+						res.setHeader('Content-Type', 'application/json');
+						res.writeHead(200);
+						res.end(JSON.stringify(response));
+						return;
+					}
+
+					// Legacy endpoints for external clients
+					if (url.pathname === '/mcp/tools' && req.method === 'GET') {
+						const tools = await this.getToolsList();
+						res.setHeader('Content-Type', 'application/json');
+						res.writeHead(200);
+						res.end(JSON.stringify({ tools }));
+						return;
+					}
+
+					if (url.pathname === '/mcp/call' && req.method === 'POST') {
+						const body = await this.getRequestBody(req);
+						const { name, arguments: args } = JSON.parse(body);
+						const result = await this.executeToolExternal(name, args || {});
+						res.setHeader('Content-Type', 'application/json');
+						res.writeHead(200);
+						res.end(JSON.stringify(result));
+						return;
+					}
+
+					if (url.pathname === '/mcp/config' && req.method === 'GET') {
+						const config = this.generateSimpleMCPConfig();
+						res.setHeader('Content-Type', 'application/json');
+						res.writeHead(200);
+						res.end(JSON.stringify(config));
+						return;
+					}
+
+					// Default response
+					res.writeHead(200);
+					res.end('Obsidian MCP Server');
+				} catch (error) {
+					console.error('Error handling request:', error);
+					res.setHeader('Content-Type', 'application/json');
+					res.writeHead(500);
+					res.end(JSON.stringify({
+						error: 'Internal server error',
+						message: error.message
+					}));
+				}
+			});
+
+			this.httpServer.listen(this.settings.serverPort, this.settings.serverHost, () => {
+				console.log(`HTTP MCP Server started on ${this.settings.serverHost}:${this.settings.serverPort}`);
+				new Notice(`HTTP MCP Server started on port ${this.settings.serverPort}`);
+			});
+
+			this.httpServer.on('error', (error) => {
+				console.error('HTTP server error:', error);
+				new Notice('HTTP server error: ' + error.message);
+			});
+		} catch (error) {
+			console.error('Failed to start HTTP server:', error);
+			new Notice('Failed to start HTTP server: ' + error.message);
+		}
+	}
+
+	private async getRequestBody(req: http.IncomingMessage): Promise<string> {
+		return new Promise((resolve, reject) => {
+			let body = '';
+			req.on('data', (chunk) => {
+				body += chunk.toString();
+			});
+			req.on('end', () => {
+				resolve(body);
+			});
+			req.on('error', (error) => {
+				reject(error);
+			});
+		});
+	}
+
+	private async handleMCPRequest(bodyStr: string, corsHeaders: Record<string, string>): Promise<any> {
+		try {
+			const sessionId = this.generateSessionId();
+			const protocolVersion = '2024-11-05';
+
+			// Get or create session
+			let session = this.sessions.get(sessionId);
+			if (!session) {
+				session = {
+					server: this.createServerInstance(),
+					lastActivity: Date.now()
+				};
+				this.sessions.set(sessionId, session);
+			} else {
+				session.lastActivity = Date.now();
+			}
+
+			const body = JSON.parse(bodyStr) as JSONRPCMessage;
+
+			// Handle JSON-RPC message
+			let response: any = null;
+
+			if ('method' in body && body.method) {
+				// Handle JSON-RPC request
+				const request = body as JSONRPCRequest;
+
+				try {
+					let result: any;
+
+					switch (request.method) {
+						case 'initialize':
+							result = {
+								protocolVersion: '2024-11-05',
+								capabilities: {
+									tools: {}
+								},
+								serverInfo: {
+									name: 'obsidian-vault-tools',
+									version: '0.1.0'
+								}
+							};
+							break;
+
+						case 'tools/list':
+							result = {
+								tools: Array.from(this.loadedTools.values())
+							};
+							break;
+
+						case 'tools/call':
+							const { name, arguments: toolArgs } = request.params as any;
+							result = await this.callTool(name, toolArgs || {});
+							break;
+
+						default:
+							throw new Error(`Unknown method: ${request.method}`);
+					}
+
+					response = {
+						jsonrpc: '2.0',
+						id: request.id,
+						result
+					};
+				} catch (error) {
+					response = {
+						jsonrpc: '2.0',
+						id: request.id,
+						error: {
+							code: -32603,
+							message: error.message
+						}
+					};
+				}
+			}
+
+			// Clean up old sessions (older than 1 hour)
+			this.cleanupSessions();
+
+			return response;
+		} catch (error) {
+			return {
+				jsonrpc: '2.0',
+				error: {
+					code: -32700,
+					message: 'Parse error'
+				}
+			};
+		}
+	}
+
+	private generateSessionId(): string {
+		return Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+	}
+
+	private cleanupSessions(): void {
+		const now = Date.now();
+		const maxAge = 60 * 60 * 1000; // 1 hour
+
+		for (const [sessionId, session] of this.sessions) {
+			if (now - session.lastActivity > maxAge) {
+				try {
+					session.server.close();
+				} catch (error) {
+					console.error(`Error closing session ${sessionId}:`, error);
+				}
+				this.sessions.delete(sessionId);
+			}
 		}
 	}
 
 	onunload() {
 		this.shutdownServer();
+	}
+
+	private setupDirectoryMonitoring() {
+		// Register vault event handlers for file changes
+		this.registerEvent(
+			this.app.vault.on('create', (file) => {
+				if (file instanceof TFile && file.path.startsWith(this.settings.toolsFolder) && file.extension === 'js') {
+					console.log(`New JS tool file detected: ${file.path}`);
+					this.reloadToolsQuietly();
+				}
+			})
+		);
+
+		this.registerEvent(
+			this.app.vault.on('modify', (file) => {
+				if (file instanceof TFile && file.path.startsWith(this.settings.toolsFolder) && file.extension === 'js') {
+					console.log(`JS tool file modified: ${file.path}`);
+					this.reloadToolsQuietly();
+				}
+			})
+		);
+
+		this.registerEvent(
+			this.app.vault.on('delete', (file) => {
+				if (file instanceof TFile && file.path.startsWith(this.settings.toolsFolder) && file.extension === 'js') {
+					console.log(`JS tool file deleted: ${file.path}`);
+					this.reloadToolsQuietly();
+				}
+			})
+		);
+
+		this.registerEvent(
+			this.app.vault.on('rename', (file, oldPath) => {
+				if (file instanceof TFile && (file.path.startsWith(this.settings.toolsFolder) || oldPath.startsWith(this.settings.toolsFolder)) && file.extension === 'js') {
+					console.log(`JS tool file renamed: ${oldPath} -> ${file.path}`);
+					this.reloadToolsQuietly();
+				}
+			})
+		);
+	}
+
+	private async reloadToolsQuietly() {
+		try {
+			await this.loadToolsFromFolder();
+			console.log(`Quietly reloaded ${this.loadedTools.size} tools`);
+		} catch (error) {
+			console.error('Error quietly reloading tools:', error);
+		}
 	}
 
 	async loadToolsFromFolder(): Promise<void> {
@@ -224,12 +515,13 @@ module.exports = getCurrentDateTime;`;
 				}
 			};
 
-			// Store the tool function for execution
-			// In a real implementation, you'd need to safely evaluate the JS
-			// For now, we'll store the content and handle execution differently
-			this.customToolFunctions.set(toolName, () => content);
-			this.loadedTools.set(toolName, tool);
-			console.log(`Loaded custom tool: ${toolName}`);
+			// Load the function as a proper module
+			const toolFunction = this.loadToolModule(content, toolName);
+			if (toolFunction) {
+				this.customToolFunctions.set(toolName, toolFunction);
+				this.loadedTools.set(toolName, tool);
+				console.log(`Loaded custom tool: ${toolName}`);
+			}
 		} catch (error) {
 			console.error(`Error loading tool from ${file.path}:`, error);
 		}
@@ -424,8 +716,8 @@ module.exports = getCurrentDateTime;`;
 	}
 
 	async executeCustomTool(name: string, arguments_: Record<string, any>): Promise<CallToolResult> {
-		const toolContent = this.customToolFunctions.get(name);
-		if (!toolContent) {
+		const toolFunction = this.customToolFunctions.get(name);
+		if (!toolFunction) {
 			return {
 				content: [{
 					type: 'text',
@@ -435,15 +727,89 @@ module.exports = getCurrentDateTime;`;
 			};
 		}
 
-		// For security and simplicity, we'll just return a placeholder
-		// In a real implementation, you'd need to safely execute the JavaScript
-		// This would require a secure sandbox or VM context
-		return {
-			content: [{
-				type: 'text',
-				text: `Custom tool ${name} would execute with arguments: ${JSON.stringify(arguments_)}\n\nNote: Custom tool execution is not yet implemented for security reasons. The tool definition has been loaded and can be used by external MCP clients.`
-			}]
-		};
+		try {
+			// Simply call the function with arguments - clean and simple!
+			const result = await toolFunction(arguments_);
+
+			return {
+				content: [{
+					type: 'text',
+					text: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
+				}]
+			};
+		} catch (error) {
+			return {
+				content: [{
+					type: 'text',
+					text: `Error executing custom tool ${name}: ${error.message}`
+				}],
+				isError: true
+			};
+		}
+	}
+
+	private loadToolModule(content: string, toolName: string): Function | null {
+		try {
+			// Create execution context with Obsidian APIs
+			const context = {
+				module: { exports: {} },
+				exports: {},
+				console,
+				JSON,
+				Date,
+				Math,
+				parseInt,
+				parseFloat,
+				String,
+				Number,
+				Boolean,
+				Array,
+				Object,
+				// Obsidian APIs available to tools
+				app: this.app,
+				vault: this.app.vault,
+				workspace: this.app.workspace
+			};
+
+			// Execute the module code once to get the exported function
+			const moduleCode = `
+				(function(module, exports, console, JSON, Date, Math, parseInt, parseFloat, String, Number, Boolean, Array, Object, app, vault, workspace) {
+					${content}
+					return module.exports || exports;
+				})
+			`;
+
+			const moduleFactory = eval(moduleCode);
+			const exportedFunction = moduleFactory(
+				context.module,
+				context.exports,
+				context.console,
+				context.JSON,
+				context.Date,
+				context.Math,
+				context.parseInt,
+				context.parseFloat,
+				context.String,
+				context.Number,
+				context.Boolean,
+				context.Array,
+				context.Object,
+				context.app,
+				context.vault,
+				context.workspace
+			);
+
+			if (typeof exportedFunction === 'function') {
+				console.log(`Successfully loaded tool module: ${toolName}`);
+				return exportedFunction;
+			} else {
+				console.error(`Tool ${toolName} does not export a function`);
+				return null;
+			}
+		} catch (error) {
+			console.error(`Failed to load tool module ${toolName}:`, error);
+			return null;
+		}
 	}
 
 	async loadSettings() {
@@ -454,9 +820,9 @@ module.exports = getCurrentDateTime;`;
 		await this.saveData(this.settings);
 	}
 
-	// Method to expose tools to external MCP clients
-	getServerInstance(): Server | null {
-		return this.server;
+	// Method to get active sessions count
+	getActiveSessionsCount(): number {
+		return this.sessions.size;
 	}
 
 	// Method to get tool list for external clients
@@ -467,6 +833,51 @@ module.exports = getCurrentDateTime;`;
 	// Method to call tools from external clients
 	async executeToolExternal(name: string, arguments_: Record<string, any>): Promise<CallToolResult> {
 		return await this.callTool(name, arguments_);
+	}
+
+	// Generate MCP client configuration JSON
+	generateMCPClientConfig(): string {
+		const config = {
+			mcpServers: {
+				"obsidian-vault-tools": {
+					transport: {
+						type: "http",
+						url: `http://${this.settings.serverHost}:${this.settings.serverPort}/mcp`,
+						headers: {
+							"Mcp-Protocol-Version": "2024-11-05"
+						}
+					},
+					description: "Obsidian vault tools via MCP HTTP transport"
+				}
+			}
+		};
+
+		return JSON.stringify(config, null, 2);
+	}
+
+	// Generate simple MCP client config for testing
+	generateSimpleMCPConfig(): object {
+		return {
+			name: "obsidian-vault-tools",
+			description: "Obsidian MCP server with custom tools",
+			version: "0.1.0",
+			protocolVersion: "2024-11-05",
+			transport: {
+				type: "http",
+				url: `http://${this.settings.serverHost}:${this.settings.serverPort}/mcp`,
+				headers: {
+					"Mcp-Protocol-Version": "2024-11-05"
+				}
+			},
+			capabilities: {
+				tools: {}
+			},
+			tools: Array.from(this.loadedTools.values()).map(tool => ({
+				name: tool.name,
+				description: tool.description,
+				inputSchema: tool.inputSchema
+			}))
+		};
 	}
 }
 
@@ -514,7 +925,7 @@ class MCPSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 
 						// Reload tools if server is running
-						if (this.plugin.settings.enabled && this.plugin.server) {
+						if (this.plugin.settings.enabled) {
 							await this.plugin.loadToolsFromFolder();
 						}
 					});
@@ -522,6 +933,32 @@ class MCPSettingTab extends PluginSettingTab {
 				// Add folder suggestions
 				new FolderSuggest(this.app, search.inputEl);
 			});
+
+		// Server configuration section
+		containerEl.createEl('h3', { text: 'Server Configuration' });
+
+		new Setting(containerEl)
+			.setName('Server Host')
+			.setDesc('Host address for the MCP server (default: localhost)')
+			.addText(text => text
+				.setPlaceholder('localhost')
+				.setValue(this.plugin.settings.serverHost)
+				.onChange(async (value) => {
+					this.plugin.settings.serverHost = value || 'localhost';
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Server Port')
+			.setDesc('Port number for the MCP server (default: 3000)')
+			.addText(text => text
+				.setPlaceholder('3000')
+				.setValue(this.plugin.settings.serverPort.toString())
+				.onChange(async (value) => {
+					const port = parseInt(value) || 3000;
+					this.plugin.settings.serverPort = port;
+					await this.plugin.saveSettings();
+				}));
 
 		// Add button to reload tools
 		new Setting(containerEl)
@@ -535,15 +972,68 @@ class MCPSettingTab extends PluginSettingTab {
 					})
 			);
 
+		// MCP Client Configuration section
+		containerEl.createEl('h3', { text: 'MCP Client Configuration' });
+
+		containerEl.createEl('p', {
+			text: 'Generate MCP client configuration to connect external clients like Ollama or other LLM tools to your Obsidian vault.'
+		});
+
+		new Setting(containerEl)
+			.setName('Generate MCP Client Config')
+			.setDesc('Generate JSON configuration for external MCP clients')
+			.addButton((button) =>
+				button
+					.setButtonText('Generate & Copy')
+					.onClick(async () => {
+						try {
+							const config = this.plugin.generateMCPClientConfig();
+							await navigator.clipboard.writeText(config);
+							new Notice('MCP client configuration copied to clipboard!');
+						} catch (error) {
+							new Notice('Failed to copy configuration: ' + error.message);
+						}
+					})
+			)
+			.addButton((button) =>
+				button
+					.setButtonText('Show Config')
+					.onClick(async () => {
+						const config = this.plugin.generateMCPClientConfig();
+						const modal = new ConfigDisplayModal(this.app, config);
+						modal.open();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('Generate Simple Config')
+			.setDesc('Generate simple configuration object for testing')
+			.addButton((button) =>
+				button
+					.setButtonText('Generate & Copy')
+					.onClick(async () => {
+						try {
+							const config = JSON.stringify(this.plugin.generateSimpleMCPConfig(), null, 2);
+							await navigator.clipboard.writeText(config);
+							new Notice('Simple MCP configuration copied to clipboard!');
+						} catch (error) {
+							new Notice('Failed to copy configuration: ' + error.message);
+						}
+					})
+			);
+
 		containerEl.createEl('h3', { text: 'Tool Status' });
 
-		if (this.plugin.settings.enabled && this.plugin.server) {
+		if (this.plugin.settings.enabled) {
 			const toolsList = Array.from(this.plugin.loadedTools.keys());
 			containerEl.createEl('p', {
-				text: `Server running with ${toolsList.length} tools: ${toolsList.join(', ')}`
+				text: `HTTP MCP Server running with ${toolsList.length} tools: ${toolsList.join(', ')}`
+			});
+			containerEl.createEl('p', {
+				text: `Server URL: http://${this.plugin.settings.serverHost}:${this.plugin.settings.serverPort}/mcp`
 			});
 		} else {
-			containerEl.createEl('p', { text: 'Server not running' });
+			containerEl.createEl('p', { text: 'MCP Server not running' });
 		}
 
 		containerEl.createEl('h3', { text: 'Instructions' });
@@ -595,5 +1085,53 @@ class FolderSuggest extends AbstractInputSuggest<string> {
 		const event = new Event('input');
 		this.inputElement.dispatchEvent(event);
 		this.close();
+	}
+}
+
+class ConfigDisplayModal extends Modal {
+	private config: string;
+
+	constructor(app: App, config: string) {
+		super(app);
+		this.config = config;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+
+		contentEl.createEl('h2', { text: 'MCP Client Configuration' });
+
+		const preEl = contentEl.createEl('pre', {
+			cls: 'mcp-config-display'
+		});
+		preEl.createEl('code', { text: this.config });
+
+		// Add copy button
+		const buttonDiv = contentEl.createDiv({ cls: 'modal-button-container' });
+		const copyButton = buttonDiv.createEl('button', {
+			text: 'Copy to Clipboard',
+			cls: 'mod-cta'
+		});
+
+		copyButton.addEventListener('click', async () => {
+			try {
+				await navigator.clipboard.writeText(this.config);
+				new Notice('Configuration copied to clipboard!');
+				this.close();
+			} catch (error) {
+				new Notice('Failed to copy to clipboard');
+			}
+		});
+
+		const closeButton = buttonDiv.createEl('button', {
+			text: 'Close'
+		});
+		closeButton.addEventListener('click', () => this.close());
+	}
+
+	onClose() {
+		const { contentEl } = this;
+		contentEl.empty();
 	}
 }
