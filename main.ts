@@ -14,6 +14,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import * as path from 'path';
 import * as http from 'http';
+import { parse as parseComment } from 'comment-parser';
 
 interface MCPPluginSettings {
 	toolsFolder: string;
@@ -483,27 +484,45 @@ module.exports = getCurrentDateTime;`;
 		try {
 			const content = await this.app.vault.read(file);
 
-			// Extract metadata from comments
-			const descMatch = content.match(/@description\s+(.+)/);
-			const paramMatches = [...content.matchAll(/@param\s+\{(\w+)\}\s+(\w+)\s*(.+)?/g)];
+			// Parse JSDoc comments using comment-parser
+			const comments = parseComment(content);
+			const firstComment = comments[0];
 
-			const description = descMatch?.[1]?.trim() || 'No description available';
-			const toolName = file.basename;
-
-			// Build input schema from @param comments
+			let description = 'No description available';
 			const properties: Record<string, any> = {};
 			const required: string[] = [];
 
-			for (const [, type, name, desc] of paramMatches) {
-				properties[name] = {
-					type: this.mapTypeToJsonSchema(type),
-					description: desc?.trim() || `${name} parameter`
-				};
-				// For now, make all params optional - you can modify this logic
-				if (!desc?.includes('Optional')) {
-					required.push(name);
+			if (firstComment) {
+				// Get description from @description tag or general description
+				const descTag = firstComment.tags.find(tag => tag.tag === 'description');
+				if (descTag) {
+					// Handle cases where description spans name and description fields
+					const namePart = descTag.name || '';
+					const descPart = descTag.description || '';
+					description = namePart ? `${namePart} ${descPart}`.trim() : descPart;
+				} else {
+					description = firstComment.description || 'No description available';
+				}
+
+				// Process @param tags
+				const paramTags = firstComment.tags.filter(tag => tag.tag === 'param');
+				for (const param of paramTags) {
+					if (param.name) {
+						const typeSchema = this.mapTypeToJsonSchema(param.type);
+						properties[param.name] = {
+							...typeSchema,
+							description: param.description || `${param.name} parameter`
+						};
+
+						// Mark as required unless description contains 'optional' (case insensitive)
+						if (!param.description?.toLowerCase().includes('optional')) {
+							required.push(param.name);
+						}
+					}
 				}
 			}
+
+			const toolName = file.basename;
 
 			const tool: Tool = {
 				name: toolName,
@@ -527,14 +546,49 @@ module.exports = getCurrentDateTime;`;
 		}
 	}
 
-	mapTypeToJsonSchema(type: string): string {
-		switch (type.toLowerCase()) {
-			case 'string': return 'string';
-			case 'number': return 'number';
-			case 'boolean': return 'boolean';
-			case 'array': return 'array';
-			case 'object': return 'object';
-			default: return 'string';
+	mapTypeToJsonSchema(type: string): any {
+		if (!type) return { type: 'string' };
+
+		const cleanType = type.trim();
+
+		// Handle array types (e.g., "string[]", "number[]")
+		if (cleanType.endsWith('[]')) {
+			const itemType = cleanType.slice(0, -2);
+			return {
+				type: 'array',
+				items: this.mapTypeToJsonSchema(itemType)
+			};
+		}
+
+		// Handle union types (e.g., "string|number")
+		if (cleanType.includes('|')) {
+			const types = cleanType.split('|').map(t => t.trim());
+			return {
+				oneOf: types.map(t => this.mapTypeToJsonSchema(t))
+			};
+		}
+
+		// Handle basic types
+		const lowerType = cleanType.toLowerCase();
+		switch (lowerType) {
+			case 'string':
+				return { type: 'string' };
+			case 'number':
+			case 'int':
+			case 'integer':
+				return { type: 'number' };
+			case 'boolean':
+			case 'bool':
+				return { type: 'boolean' };
+			case 'array':
+				return { type: 'array' };
+			case 'object':
+				return { type: 'object' };
+			case 'null':
+				return { type: 'null' };
+			default:
+				// For unknown types, default to string
+				return { type: 'string' };
 		}
 	}
 
@@ -777,7 +831,7 @@ export default (typeof module !== 'undefined' && module.exports) ||
 			try {
 				const module = await import(moduleUrl);
 				const exportedFunction = module.default;
-				
+
 				if (typeof exportedFunction === 'function') {
 					console.log(`Successfully loaded tool module: ${toolName}`);
 					return exportedFunction;
@@ -1029,11 +1083,11 @@ class MCPSettingTab extends PluginSettingTab {
 		containerEl.createEl('pre', {
 			text: `/**
  * @description Get the current date and time
- * @param {string} format Optional format string
+ * @param {string} format - Optional format string
  */
 function getCurrentDateTime(params) {
     const now = new Date();
-    return now.toISOString();
+    return moment(now).format(params?.format)
 }
 
 module.exports = getCurrentDateTime;`
