@@ -21,6 +21,8 @@ interface MCPPluginSettings {
 	enabled: boolean;
 	serverPort: number;
 	serverHost: string;
+	hotReloading: boolean;
+	showStartupLogs: boolean;
 }
 
 const DEFAULT_SETTINGS: MCPPluginSettings = {
@@ -28,6 +30,8 @@ const DEFAULT_SETTINGS: MCPPluginSettings = {
 	enabled: false,
 	serverPort: 3000,
 	serverHost: 'localhost',
+	hotReloading: true,
+	showStartupLogs: false,
 };
 
 export default class MCPPlugin extends Plugin {
@@ -40,6 +44,8 @@ export default class MCPPlugin extends Plugin {
 	loadedTools: Map<string, Tool> = new Map();
 	private customToolFunctions: Map<string, Function> = new Map();
 	private fileWatcher: any = null;
+	private previousToolNames: Set<string> = new Set();
+	private isStarting: boolean = true;
 
 	async onload() {
 		console.log('Loading MCP Tools Plugin');
@@ -54,8 +60,13 @@ export default class MCPPlugin extends Plugin {
 			await this.startHTTPServer();
 		}
 
-		// Set up directory monitoring for automatic tool reloading
-		this.setupDirectoryMonitoring();
+		// Mark startup as complete BEFORE setting up file monitoring
+		this.isStarting = false;
+
+		// Set up directory monitoring for automatic tool reloading (if enabled)
+		if (this.settings.hotReloading) {
+			this.setupDirectoryMonitoring();
+		}
 
 		// Add command to toggle MCP server
 		this.addCommand({
@@ -76,11 +87,15 @@ export default class MCPPlugin extends Plugin {
 		try {
 			// Tools are already loaded in onload(), no need to reload here
 			// Server will be created per session in HTTP transport
-			new Notice('MCP Server initialized successfully');
+			if (!this.isStarting || this.settings.showStartupLogs) {
+				new Notice('MCP Server initialized successfully');
+			}
 			console.log('MCP server initialized with tools:', Array.from(this.loadedTools.keys()));
 		} catch (error) {
 			console.error('Failed to initialize MCP server:', error);
-			new Notice('Failed to initialize MCP server: ' + error.message);
+			if (!this.isStarting || this.settings.showStartupLogs) {
+				new Notice('Failed to initialize MCP server: ' + error.message);
+			}
 		}
 	}
 
@@ -117,20 +132,92 @@ export default class MCPPlugin extends Plugin {
 			// Tools are already loaded, just initialize and start server
 			await this.initializeMCPServer();
 			await this.startHTTPServer();
-			new Notice('MCP Server enabled');
+			if (!this.isStarting || this.settings.showStartupLogs) {
+				new Notice('MCP Server enabled');
+			}
 		} else {
 			this.shutdownServer();
-			new Notice('MCP Server disabled');
+			if (!this.isStarting || this.settings.showStartupLogs) {
+				new Notice('MCP Server disabled');
+			}
 		}
 	}
 
 	async reloadTools() {
 		if (this.settings.enabled) {
 			await this.loadToolsFromFolder();
-			new Notice(`Reloaded ${this.loadedTools.size} tools`);
+			if (!this.isStarting || this.settings.showStartupLogs) {
+				new Notice(`Reloaded ${this.loadedTools.size} tools`);
+			}
 		} else {
-			new Notice('MCP Server is not running');
+			if (!this.isStarting || this.settings.showStartupLogs) {
+				new Notice('MCP Server is not running');
+			}
 		}
+	}
+
+	async restartServer() {
+		if (this.settings.enabled) {
+			console.log('Restarting MCP Server...');
+			
+			// Save current tool names for comparison
+			const previousTools = new Set(this.loadedTools.keys());
+			
+			// Gracefully shutdown and wait for port to be released
+			await this.shutdownServerGracefully();
+			
+			await this.loadToolsFromFolder();
+			await this.initializeMCPServer();
+			await this.startHTTPServer();
+			
+			// Compare and notify about changes
+			const currentTools = new Set(this.loadedTools.keys());
+			const newTools = [...currentTools].filter(tool => !previousTools.has(tool));
+			const removedTools = [...previousTools].filter(tool => !currentTools.has(tool));
+			
+			let noticeMessage = `MCP Server restarted with ${this.loadedTools.size} tools`;
+			
+			if (newTools.length > 0) {
+				noticeMessage += `\n✅ Added: ${newTools.join(', ')}`;
+			}
+			
+			if (removedTools.length > 0) {
+				noticeMessage += `\n❌ Removed: ${removedTools.join(', ')}`;
+			}
+			
+			// Only show notification if not starting up or if startup logs are enabled
+			if (!this.isStarting || this.settings.showStartupLogs) {
+				new Notice(noticeMessage);
+			}
+			console.log('Server restart complete:', { total: this.loadedTools.size, newTools, removedTools });
+		}
+	}
+
+	async shutdownServerGracefully(): Promise<void> {
+		return new Promise((resolve) => {
+			// Close all session servers
+			for (const [sessionId, session] of this.sessions) {
+				try {
+					session.server.close();
+				} catch (error) {
+					console.error(`Error closing session ${sessionId}:`, error);
+				}
+			}
+			this.sessions.clear();
+
+			if (this.httpServer) {
+				this.httpServer.close((err) => {
+					if (err) {
+						console.error('Error closing HTTP server:', err);
+					}
+					this.httpServer = null;
+					// Wait a bit for the port to be fully released
+					setTimeout(resolve, 100);
+				});
+			} else {
+				resolve();
+			}
+		});
 	}
 
 	shutdownServer() {
@@ -174,6 +261,9 @@ export default class MCPPlugin extends Plugin {
 				}
 
 				try {
+					// Log all incoming requests for debugging
+					console.log(`[MCP Server] ${req.method} ${url.pathname} - Headers:`, req.headers);
+					
 					// Handle MCP Streamable HTTP Transport
 					if (url.pathname === '/mcp' && req.method === 'POST') {
 						const body = await this.getRequestBody(req);
@@ -203,8 +293,43 @@ export default class MCPPlugin extends Plugin {
 						return;
 					}
 
+					// OpenAPI spec endpoint
+					if (url.pathname === '/openapi.json' && req.method === 'GET') {
+						const spec = this.generateOpenAPIConfig();
+						res.setHeader('Content-Type', 'application/json');
+						res.writeHead(200);
+						res.end(JSON.stringify(spec));
+						return;
+					}
+
+					// Handle OpenAPI tool calls
+					if (url.pathname.startsWith('/tools/') && req.method === 'POST') {
+						const toolName = url.pathname.substring(7); // Remove '/tools/'
+						console.log(`[MCP Server] Calling tool: ${toolName}`);
+						const body = await this.getRequestBody(req);
+						console.log(`[MCP Server] Tool args:`, body);
+						
+						// Handle empty body for tools with no parameters
+						let args = {};
+						if (body.trim()) {
+							try {
+								args = JSON.parse(body);
+							} catch (error) {
+								console.error('Failed to parse JSON body:', error);
+								args = {};
+							}
+						}
+						
+						const result = await this.executeToolExternal(toolName, args);
+						console.log(`[MCP Server] Tool result:`, result);
+						res.setHeader('Content-Type', 'application/json');
+						res.writeHead(200);
+						res.end(JSON.stringify(result));
+						return;
+					}
+
 					if (url.pathname === '/mcp/config' && req.method === 'GET') {
-						const config = this.generateSimpleMCPConfig();
+						const config = this.generateOpenAPIConfig();
 						res.setHeader('Content-Type', 'application/json');
 						res.writeHead(200);
 						res.end(JSON.stringify(config));
@@ -227,7 +352,9 @@ export default class MCPPlugin extends Plugin {
 
 			this.httpServer.listen(this.settings.serverPort, this.settings.serverHost, () => {
 				console.log(`HTTP MCP Server started on ${this.settings.serverHost}:${this.settings.serverPort}`);
-				new Notice(`HTTP MCP Server started on port ${this.settings.serverPort}`);
+				if (!this.isStarting || this.settings.showStartupLogs) {
+					new Notice(`HTTP MCP Server started on ${this.settings.serverHost}:${this.settings.serverPort}`);
+				}
 			});
 
 			this.httpServer.on('error', (error) => {
@@ -369,7 +496,7 @@ export default class MCPPlugin extends Plugin {
 		this.shutdownServer();
 	}
 
-	private setupDirectoryMonitoring() {
+	setupDirectoryMonitoring() {
 		// Register vault event handlers for file changes
 		this.registerEvent(
 			this.app.vault.on('create', (file) => {
@@ -410,8 +537,13 @@ export default class MCPPlugin extends Plugin {
 
 	private async reloadToolsQuietly() {
 		try {
-			await this.loadToolsFromFolder();
-			console.log(`Quietly reloaded ${this.loadedTools.size} tools`);
+			if (this.settings.hotReloading && this.settings.enabled) {
+				console.log('Hot reloading: Restarting server with updated tools...');
+				await this.restartServer();
+			} else {
+				await this.loadToolsFromFolder();
+				console.log(`Quietly reloaded ${this.loadedTools.size} tools`);
+			}
 		} catch (error) {
 			console.error('Error quietly reloading tools:', error);
 		}
@@ -892,6 +1024,98 @@ export default (typeof module !== 'undefined' && module.exports) ||
 		return JSON.stringify(config, null, 2);
 	}
 
+	// Generate OpenAPI spec for Open WebUI
+	generateOpenAPIConfig(): object {
+		const tools = Array.from(this.loadedTools.values());
+		
+		const paths: Record<string, any> = {};
+		const components = {
+			schemas: {} as Record<string, any>
+		};
+
+		// Convert each MCP tool to an OpenAPI endpoint
+		tools.forEach(tool => {
+			const operationId = tool.name; // Keep original name with dots and hyphens
+			const schemaName = `${tool.name.replace(/[^a-zA-Z0-9]/g, '_')}Request`; // Schema names need to be valid identifiers
+			
+			// Create schema for the tool's input
+			components.schemas[schemaName] = {
+				type: 'object',
+				properties: tool.inputSchema.properties || {},
+				required: tool.inputSchema.required || []
+			};
+
+			// Check if tool has any parameters
+			const hasParameters = Object.keys(tool.inputSchema.properties || {}).length > 0;
+			
+			// Create the path for this tool
+			const pathConfig: any = {
+				post: {
+					summary: tool.description,
+					description: tool.description,
+					operationId: operationId,
+				}
+			};
+
+			// Only add requestBody if the tool has parameters
+			if (hasParameters) {
+				pathConfig.post.requestBody = {
+					required: tool.inputSchema.required && tool.inputSchema.required.length > 0,
+					content: {
+						'application/json': {
+							schema: {
+								$ref: `#/components/schemas/${schemaName}`
+							}
+						}
+					}
+				};
+			}
+
+			pathConfig.post.responses = {
+				'200': {
+					description: 'Tool execution result',
+					content: {
+						'application/json': {
+							schema: {
+								type: 'object',
+								properties: {
+									content: {
+										type: 'array',
+										items: {
+											type: 'object',
+											properties: {
+												type: { type: 'string' },
+												text: { type: 'string' }
+											}
+										}
+									},
+									isError: { type: 'boolean' }
+								}
+							}
+						}
+					}
+				}
+			};
+			
+			paths[`/tools/${tool.name}`] = pathConfig;
+		});
+
+		return {
+			openapi: '3.0.0',
+			info: {
+				title: 'Obsidian Vault Tools',
+				description: 'Obsidian MCP server with custom tools',
+				version: '0.1.0'
+			},
+			servers: [{
+				url: `http://${this.settings.serverHost}:${this.settings.serverPort}`,
+				description: 'Local Obsidian MCP Server'
+			}],
+			paths,
+			components
+		};
+	}
+
 	// Generate simple MCP client config for testing
 	generateSimpleMCPConfig(): object {
 		return {
@@ -997,15 +1221,54 @@ class MCPSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
-		// Add button to reload tools
+		// Hot reloading toggle
+		new Setting(containerEl)
+			.setName('Hot Reloading')
+			.setDesc('Automatically restart server when tool files are modified')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.hotReloading)
+					.onChange(async (value) => {
+						this.plugin.settings.hotReloading = value;
+						await this.plugin.saveSettings();
+
+						if (value && this.plugin.settings.enabled) {
+							// Enable file monitoring
+							this.plugin.setupDirectoryMonitoring();
+							new Notice('Hot reloading enabled');
+						} else {
+							new Notice('Hot reloading disabled');
+						}
+					})
+			);
+
+		// Show startup logs toggle
+		new Setting(containerEl)
+			.setName('Show Startup Logs')
+			.setDesc('Show notifications when MCP server starts up')
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showStartupLogs)
+					.onChange(async (value) => {
+						this.plugin.settings.showStartupLogs = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		// Manual reload tools button
 		new Setting(containerEl)
 			.setName('Reload Tools')
-			.setDesc('Reload all tools from the tools folder')
+			.setDesc('Manually restart server with updated tools from the folder')
 			.addButton((button) =>
 				button
-					.setButtonText('Reload')
+					.setButtonText('Restart Server')
+					.setClass('mod-cta')
 					.onClick(async () => {
-						await this.plugin.reloadTools();
+						if (this.plugin.settings.enabled) {
+							await this.plugin.restartServer();
+						} else {
+							new Notice('MCP Server is not running');
+						}
 					})
 			);
 
@@ -1043,16 +1306,16 @@ class MCPSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName('Generate Simple Config')
-			.setDesc('Generate simple configuration object for testing')
+			.setName('Generate OpenAPI Config')
+			.setDesc('Generate OpenAPI specification for Open WebUI')
 			.addButton((button) =>
 				button
 					.setButtonText('Generate & Copy')
 					.onClick(async () => {
 						try {
-							const config = JSON.stringify(this.plugin.generateSimpleMCPConfig(), null, 2);
+							const config = JSON.stringify(this.plugin.generateOpenAPIConfig(), null, 2);
 							await navigator.clipboard.writeText(config);
-							new Notice('Simple MCP configuration copied to clipboard!');
+							new Notice('OpenAPI configuration copied to clipboard!');
 						} catch (error) {
 							new Notice('Failed to copy configuration: ' + error.message);
 						}
