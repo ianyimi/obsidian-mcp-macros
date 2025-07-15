@@ -159,32 +159,32 @@ export default class MCPPlugin extends Plugin {
 	async restartServer() {
 		if (this.settings.enabled) {
 			console.log('Restarting MCP Server...');
-			
+
 			// Save current tool names for comparison
 			const previousTools = new Set(this.loadedTools.keys());
-			
+
 			// Gracefully shutdown and wait for port to be released
 			await this.shutdownServerGracefully();
-			
+
 			await this.loadToolsFromFolder();
 			await this.initializeMCPServer();
 			await this.startHTTPServer();
-			
+
 			// Compare and notify about changes
 			const currentTools = new Set(this.loadedTools.keys());
 			const newTools = [...currentTools].filter(tool => !previousTools.has(tool));
 			const removedTools = [...previousTools].filter(tool => !currentTools.has(tool));
-			
+
 			let noticeMessage = `MCP Server restarted with ${this.loadedTools.size} tools`;
-			
+
 			if (newTools.length > 0) {
 				noticeMessage += `\n✅ Added: ${newTools.join(', ')}`;
 			}
-			
+
 			if (removedTools.length > 0) {
 				noticeMessage += `\n❌ Removed: ${removedTools.join(', ')}`;
 			}
-			
+
 			// Only show notification if not starting up or if startup logs are enabled
 			if (!this.isStarting || this.settings.showStartupLogs) {
 				new Notice(noticeMessage);
@@ -263,7 +263,7 @@ export default class MCPPlugin extends Plugin {
 				try {
 					// Log all incoming requests for debugging
 					console.log(`[MCP Server] ${req.method} ${url.pathname} - Headers:`, req.headers);
-					
+
 					// Handle MCP Streamable HTTP Transport
 					if (url.pathname === '/mcp' && req.method === 'POST') {
 						const body = await this.getRequestBody(req);
@@ -286,7 +286,7 @@ export default class MCPPlugin extends Plugin {
 					if (url.pathname === '/mcp/call' && req.method === 'POST') {
 						const body = await this.getRequestBody(req);
 						const { name, arguments: args } = JSON.parse(body);
-						const result = await this.executeToolExternal(name, args || {});
+						const result = await this.executeToolExternal(name, args ?? {});
 						res.setHeader('Content-Type', 'application/json');
 						res.writeHead(200);
 						res.end(JSON.stringify(result));
@@ -308,7 +308,7 @@ export default class MCPPlugin extends Plugin {
 						console.log(`[MCP Server] Calling tool: ${toolName}`);
 						const body = await this.getRequestBody(req);
 						console.log(`[MCP Server] Tool args:`, body);
-						
+
 						// Handle empty body for tools with no parameters
 						let args = {};
 						if (body.trim()) {
@@ -319,7 +319,7 @@ export default class MCPPlugin extends Plugin {
 								args = {};
 							}
 						}
-						
+
 						const result = await this.executeToolExternal(toolName, args);
 						console.log(`[MCP Server] Tool result:`, result);
 						res.setHeader('Content-Type', 'application/json');
@@ -920,8 +920,9 @@ module.exports = getCurrentDateTime;`;
 			return {
 				content: [{
 					type: 'text',
-					text: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
-				}]
+					text: JSON.stringify(result)
+				}],
+				structuredContent: typeof result === 'object' ? result : undefined
 			};
 		} catch (error) {
 			return {
@@ -1027,7 +1028,7 @@ export default (typeof module !== 'undefined' && module.exports) ||
 	// Generate OpenAPI spec for Open WebUI
 	generateOpenAPIConfig(): object {
 		const tools = Array.from(this.loadedTools.values());
-		
+
 		const paths: Record<string, any> = {};
 		const components = {
 			schemas: {} as Record<string, any>
@@ -1037,7 +1038,7 @@ export default (typeof module !== 'undefined' && module.exports) ||
 		tools.forEach(tool => {
 			const operationId = tool.name; // Keep original name with dots and hyphens
 			const schemaName = `${tool.name.replace(/[^a-zA-Z0-9]/g, '_')}Request`; // Schema names need to be valid identifiers
-			
+
 			// Create schema for the tool's input
 			components.schemas[schemaName] = {
 				type: 'object',
@@ -1047,7 +1048,7 @@ export default (typeof module !== 'undefined' && module.exports) ||
 
 			// Check if tool has any parameters
 			const hasParameters = Object.keys(tool.inputSchema.properties || {}).length > 0;
-			
+
 			// Create the path for this tool
 			const pathConfig: any = {
 				post: {
@@ -1096,7 +1097,7 @@ export default (typeof module !== 'undefined' && module.exports) ||
 					}
 				}
 			};
-			
+
 			paths[`/tools/${tool.name}`] = pathConfig;
 		});
 
